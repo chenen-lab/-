@@ -1,0 +1,343 @@
+# -*- coding: utf-8 -*-
+"""
+門窗自動標註腳本 v1
+適用環境：pyRevit 或 RevitPythonShell
+
+標籤族群規則：
+  門 - 一般門（非 FD 開頭）→ FT-門標籤(±0)   ID=3613998
+  門 - 防火門（FD 開頭）    → FT-門標籤(+-)   ID=3613996
+  窗 - 全部窗               → FT-窗標籤(+-)   ID=3613289
+
+偏移策略：
+  標籤位置 = 元件幾何中心 + (元件最大邊/2) + 300mm（安全距離）
+  門：優先往右上方，8 方向防重疊
+  窗：優先往左上方，8 方向防重疊
+  防重疊最小間距：250mm
+"""
+
+import math
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    BuiltInCategory,
+    IndependentTag,
+    TagMode,
+    TagOrientation,
+    LeaderEndCondition,
+    Reference,
+    XYZ,
+    ElementId,
+    FamilySymbol,
+    Transaction,
+)
+from Autodesk.Revit.UI import TaskDialog
+
+# ─────────────────────────────────────────
+# 基本設定
+# ─────────────────────────────────────────
+doc         = __revit__.ActiveUIDocument.Document
+target_view = doc.ActiveView   # 自動抓取目前開啟的視圖
+
+def mm_to_ft(mm):
+    return mm / 304.8
+
+# 安全偏移（元件邊緣外推）
+BASE_OFFSET_MM  = 300.0
+BASE_OFFSET_FT  = mm_to_ft(BASE_OFFSET_MM)
+
+# 防重疊最小間距
+MIN_SPACING_FT  = mm_to_ft(250.0)
+
+# ─────────────────────────────────────────
+# 門標籤族群 ID（參考 A-1F-01）
+#   FT-門標籤(±0) → 一般門（D 系列）
+#   FT-門標籤(+-) → 防火門（FD 系列）
+# ─────────────────────────────────────────
+DOOR_MAIN_TAG_ID = 3613998   # FT-門標籤(±0)
+DOOR_ALT_TAG_ID  = 3613996   # FT-門標籤(+-)
+WINDOW_TAG_ID    = 3613289   # FT-窗標籤(+-)
+
+# ─────────────────────────────────────────
+# 候選偏移方向
+# 門：右上優先（不與右側牆體衝突）
+# 窗：左上優先（窗通常在外牆，往室內側偏移）
+# ─────────────────────────────────────────
+DOOR_DIRS = [
+    ( 1,  1), (-1,  1), ( 1, -1), (-1, -1),
+    ( 2,  1), ( 1,  2), (-2,  1), ( 1, -2),
+]
+WINDOW_DIRS = [
+    (-1,  1), ( 1,  1), (-1, -1), ( 1, -1),
+    (-2,  1), ( 1,  2), ( 2,  1), ( 1, -2),
+]
+
+# ─────────────────────────────────────────
+# 工具函式
+# ─────────────────────────────────────────
+def get_type_name_safe(element):
+    """安全讀取型號名稱，強制 UTF-8 處理"""
+    try:
+        type_el = doc.GetElement(element.GetTypeId())
+        if type_el is None:
+            return u""
+        raw = type_el.Name or u""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw
+    except Exception:
+        return u""
+
+def get_bbox_center_and_offset(element, view):
+    """
+    取得元素幾何中心點與安全偏移距離。
+    安全偏移 = (最大邊長 / 2) + BASE_OFFSET_FT
+    回傳 (center, safe_offset) 或 (None, None)
+    """
+    bbox = element.get_BoundingBox(view)
+    if bbox is None:
+        bbox = element.get_BoundingBox(None)
+    if bbox is None:
+        return None, None
+
+    center = XYZ(
+        (bbox.Min.X + bbox.Max.X) / 2.0,
+        (bbox.Min.Y + bbox.Max.Y) / 2.0,
+        (bbox.Min.Z + bbox.Max.Z) / 2.0
+    )
+    max_half = max(
+        abs(bbox.Max.X - bbox.Min.X),
+        abs(bbox.Max.Y - bbox.Min.Y)
+    ) / 2.0
+    safe_offset = max_half + BASE_OFFSET_FT
+    return center, safe_offset
+
+def find_tag_position(center, safe_offset, dirs, placed_positions):
+    """
+    從候選方向中找出不與已放置標籤衝突的位置。
+    若全部衝突，回傳最後一個候選（最遠處）。
+    """
+    for (dx_mult, dy_mult) in dirs:
+        candidate = XYZ(
+            center.X + safe_offset * dx_mult,
+            center.Y + safe_offset * dy_mult,
+            center.Z
+        )
+        conflict = False
+        for placed in placed_positions:
+            dx = candidate.X - placed.X
+            dy = candidate.Y - placed.Y
+            if math.sqrt(dx * dx + dy * dy) < MIN_SPACING_FT:
+                conflict = True
+                break
+        if not conflict:
+            return candidate
+
+    # 所有方向衝突，使用最後候選
+    dx_mult, dy_mult = dirs[-1]
+    return XYZ(
+        center.X + safe_offset * dx_mult,
+        center.Y + safe_offset * dy_mult,
+        center.Z
+    )
+
+def create_tag(element, tag_sym, tag_pos, view_id):
+    """
+    建立 IndependentTag，強制指定族群型號並開啟自由引線。
+    回傳 True/False。
+    """
+    try:
+        ref     = Reference(element)
+        new_tag = IndependentTag.Create(
+            doc,
+            view_id,
+            ref,
+            True,                        # addLeader = True
+            TagMode.TM_ADDBY_CATEGORY,
+            TagOrientation.Horizontal,
+            tag_pos
+        )
+        new_tag.ChangeTypeId(tag_sym.Id)          # 強制指定族群型號
+        new_tag.LeaderEndCondition = LeaderEndCondition.Free
+        new_tag.TagHeadPosition = tag_pos
+        return True
+    except Exception as e:
+        return False
+
+# ─────────────────────────────────────────
+# 驗證標籤族群是否存在
+# ─────────────────────────────────────────
+door_main_sym = doc.GetElement(ElementId(DOOR_MAIN_TAG_ID))
+door_alt_sym  = doc.GetElement(ElementId(DOOR_ALT_TAG_ID))
+window_sym    = doc.GetElement(ElementId(WINDOW_TAG_ID))
+
+missing = []
+if door_main_sym is None: missing.append(u"FT-門標籤(±0) ID={}".format(DOOR_MAIN_TAG_ID))
+if door_alt_sym  is None: missing.append(u"FT-門標籤(+-) ID={}".format(DOOR_ALT_TAG_ID))
+if window_sym    is None: missing.append(u"FT-窗標籤(+-) ID={}".format(WINDOW_TAG_ID))
+
+if missing:
+    TaskDialog.Show(
+        u"錯誤：找不到標籤族群",
+        u"以下族群不存在，請確認 ID 或重新載入族群：\n\n" + u"\n".join(missing)
+    )
+    raise SystemExit
+
+# ─────────────────────────────────────────
+# 掃描視圖中所有門與窗
+# ─────────────────────────────────────────
+view_id = target_view.Id
+
+doors = FilteredElementCollector(doc, view_id) \
+    .OfCategory(BuiltInCategory.OST_Doors) \
+    .WhereElementIsNotElementType() \
+    .ToElements()
+
+windows = FilteredElementCollector(doc, view_id) \
+    .OfCategory(BuiltInCategory.OST_Windows) \
+    .WhereElementIsNotElementType() \
+    .ToElements()
+
+print(u"=" * 55)
+print(u"目標視圖：{}".format(target_view.Name))
+print(u"掃描到門：{} 樘 | 窗：{} 樘".format(len(doors), len(windows)))
+print(u"=" * 55)
+
+# ─────────────────────────────────────────
+# 查詢已存在標籤位置（防重疊用）
+# ─────────────────────────────────────────
+existing_tags = FilteredElementCollector(doc, view_id) \
+    .OfClass(IndependentTag) \
+    .WhereElementIsNotElementType() \
+    .ToElements()
+
+placed_positions = []
+tagged_ids = set()
+
+for t in existing_tags:
+    try:
+        for tid in t.GetTaggedLocalElementIds():
+            tagged_ids.add(tid.IntegerValue)
+    except Exception:
+        pass
+    try:
+        placed_positions.append(t.TagHeadPosition)
+    except Exception:
+        pass
+
+print(u"視圖中已有標籤元件：{} 個".format(len(tagged_ids)))
+
+# ─────────────────────────────────────────
+# 執行標註
+# ─────────────────────────────────────────
+door_success = 0
+door_skipped = 0
+door_failed  = 0
+win_success  = 0
+win_skipped  = 0
+win_failed   = 0
+failed_info  = []
+
+t = Transaction(doc, u"門窗自動標註 v1（參考 A-1F-01）")
+t.Start()
+
+try:
+    # ── 門標註 ──
+    for door in doors:
+        col_id    = door.Id
+        type_name = get_type_name_safe(door)
+
+        # 已有標籤則跳過
+        if col_id.IntegerValue in tagged_ids:
+            print(u"  [跳過門] ID={} | {}".format(col_id.IntegerValue, type_name))
+            door_skipped += 1
+            continue
+
+        # 判斷門種類：FD 開頭為防火門，使用 FT-門標籤(+-)
+        is_fd  = type_name.upper().startswith("FD")
+        sym    = door_alt_sym if is_fd else door_main_sym
+        label  = u"FT-門標籤(+-)" if is_fd else u"FT-門標籤(±0)"
+
+        # 取得幾何中心與安全偏移
+        center, safe_offset = get_bbox_center_and_offset(door, target_view)
+        if center is None:
+            print(u"  [失敗門] ID={} | {} | 無BBox".format(col_id.IntegerValue, type_name))
+            door_failed += 1
+            failed_info.append(u"門 ID={} ({})".format(col_id.IntegerValue, type_name))
+            continue
+
+        # 找不衝突位置
+        tag_pos = find_tag_position(center, safe_offset, DOOR_DIRS, placed_positions)
+
+        # 建立標籤
+        if create_tag(door, sym, tag_pos, view_id):
+            placed_positions.append(tag_pos)
+            print(u"  [門✅] ID={} | {} → {}".format(col_id.IntegerValue, type_name, label))
+            door_success += 1
+        else:
+            door_failed += 1
+            failed_info.append(u"門 ID={} ({})".format(col_id.IntegerValue, type_name))
+            print(u"  [門❌] ID={} | {}".format(col_id.IntegerValue, type_name))
+
+    # ── 窗標註 ──
+    for win in windows:
+        col_id    = win.Id
+        type_name = get_type_name_safe(win)
+
+        # 已有標籤則跳過
+        if col_id.IntegerValue in tagged_ids:
+            print(u"  [跳過窗] ID={} | {}".format(col_id.IntegerValue, type_name))
+            win_skipped += 1
+            continue
+
+        center, safe_offset = get_bbox_center_and_offset(win, target_view)
+        if center is None:
+            print(u"  [失敗窗] ID={} | {} | 無BBox".format(col_id.IntegerValue, type_name))
+            win_failed += 1
+            failed_info.append(u"窗 ID={} ({})".format(col_id.IntegerValue, type_name))
+            continue
+
+        tag_pos = find_tag_position(center, safe_offset, WINDOW_DIRS, placed_positions)
+
+        if create_tag(win, window_sym, tag_pos, view_id):
+            placed_positions.append(tag_pos)
+            print(u"  [窗✅] ID={} | {} → FT-窗標籤(+-)".format(col_id.IntegerValue, type_name))
+            win_success += 1
+        else:
+            win_failed += 1
+            failed_info.append(u"窗 ID={} ({})".format(col_id.IntegerValue, type_name))
+            print(u"  [窗❌] ID={} | {}".format(col_id.IntegerValue, type_name))
+
+    t.Commit()
+    print(u"\n✅ 交易已提交（Commit）")
+
+except Exception as e:
+    t.RollBack()
+    print(u"\n❌ 交易已回滾（RollBack）：{}".format(str(e)))
+    raise
+
+# ─────────────────────────────────────────
+# 結果摘要
+# ─────────────────────────────────────────
+print(u"\n" + u"=" * 55)
+print(u"執行結果摘要")
+print(u"=" * 55)
+print(u"  🚪 門 成功：{} 樘 | 跳過：{} | 失敗：{}".format(door_success, door_skipped, door_failed))
+print(u"  🪟 窗 成功：{} 樘 | 跳過：{} | 失敗：{}".format(win_success,  win_skipped,  win_failed))
+if failed_info:
+    print(u"\n  失敗詳情：")
+    for info in failed_info:
+        print(u"    • " + info)
+print(u"=" * 55)
+
+TaskDialog.Show(
+    u"門窗自動標註 v1",
+    (
+        u"執行完成！（參考 A-1F-01 標準）\n\n"
+        u"🚪 門 成功：{} 樘  跳過：{}  失敗：{}\n"
+        u"🪟 窗 成功：{} 樘  跳過：{}  失敗：{}\n\n"
+        u"標籤族群：\n"
+        u"  一般門 → FT-門標籤(±0)\n"
+        u"  防火門 → FT-門標籤(+-)\n"
+        u"  所有窗 → FT-窗標籤(+-)"
+    ).format(door_success, door_skipped, door_failed,
+             win_success,  win_skipped,  win_failed)
+)
