@@ -1,0 +1,211 @@
+# -*- coding: utf-8 -*-
+"""
+結構牆寬度自動標註 v1.0
+適用環境：pyRevit 或 RevitPythonShell
+"""
+
+import math
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.UI import TaskDialog
+
+# ─────────────────────────────────────────
+# 1. 初始化與視圖驗證
+# ─────────────────────────────────────────
+doc         = __revit__.ActiveUIDocument.Document
+target_view = doc.ActiveView
+
+if target_view.ViewType not in [ViewType.FloorPlan, ViewType.EngineeringPlan]:
+    TaskDialog.Show(u"錯誤", u"請切換至平面視圖後再執行。")
+    raise SystemExit
+
+# ─────────────────────────────────────────
+# 2. 標註類型設定（參考 A-1F-01）
+# ─────────────────────────────────────────
+DIM_TYPE_ID = 433146   # DIM(TXT_2mm)黑
+
+dim_type = doc.GetElement(ElementId(DIM_TYPE_ID))
+if dim_type is None:
+    TaskDialog.Show(u"錯誤", u"找不到標註類型 DIM(TXT_2mm)黑 (ID={})，請確認 ID 是否正確。".format(DIM_TYPE_ID))
+    raise SystemExit
+
+print(u"=" * 55)
+print(u"目標視圖：{}".format(target_view.Name))
+print(u"標註類型：{}".format(dim_type.Name))
+print(u"=" * 55)
+
+# ─────────────────────────────────────────
+# 3. 常數設定
+# ─────────────────────────────────────────
+def mm_to_ft(mm): return mm / 304.8
+
+DIM_OFFSET_FT = mm_to_ft(300.0)
+
+# ─────────────────────────────────────────
+# 4. 結構牆篩選
+# ─────────────────────────────────────────
+def is_structural_wall(wall):
+    try:
+        p = wall.get_Parameter(BuiltInParameter.WALL_STRUCTURAL_USAGE_PARAM)
+        return p is not None and p.AsInteger() != 0
+    except Exception:
+        return False
+
+all_walls = FilteredElementCollector(doc, target_view.Id) \
+    .OfCategory(BuiltInCategory.OST_Walls) \
+    .WhereElementIsNotElementType() \
+    .ToElements()
+
+structural_walls = [w for w in all_walls if is_structural_wall(w)]
+print(u"總牆體：{} 面 | 結構牆：{} 面".format(len(all_walls), len(structural_walls)))
+
+# ─────────────────────────────────────────
+# 5. 查詢已存在的牆尺寸標註（防重複）
+# ─────────────────────────────────────────
+existing_dims = FilteredElementCollector(doc, target_view.Id) \
+    .OfClass(Dimension) \
+    .WhereElementIsNotElementType() \
+    .ToElements()
+
+tagged_wall_ids = set()
+for dim in existing_dims:
+    try:
+        refs = dim.References
+        for r in refs:
+            el = doc.GetElement(r.ElementId)
+            if el is not None and el.Category is not None and \
+               el.Category.Id.IntegerValue == int(BuiltInCategory.OST_Walls):
+                tagged_wall_ids.add(el.Id.IntegerValue)
+    except Exception:
+        pass
+
+print(u"已有標註的牆：{} 面".format(len(tagged_wall_ids)))
+print(u"=" * 55)
+
+# ─────────────────────────────────────────
+# 6. 核心函式：取得牆面參考
+# ─────────────────────────────────────────
+def get_wall_references(wall):
+    try:
+        ext_refs = HostObjectUtils.GetSideFaces(wall, ShellLayerType.Exterior)
+        int_refs = HostObjectUtils.GetSideFaces(wall, ShellLayerType.Interior)
+        if not ext_refs or len(ext_refs) == 0: return None, None
+        if not int_refs or len(int_refs) == 0: return None, None
+        return ext_refs[0], int_refs[0]
+    except Exception:
+        return None, None
+
+# ─────────────────────────────────────────
+# 7. 執行標註
+# ─────────────────────────────────────────
+success_count = 0
+skipped_count = 0
+failed_count  = 0
+failed_info   = []
+
+t = Transaction(doc, u"結構牆寬度自動標註 v1.0")
+t.Start()
+
+try:
+    for wall in structural_walls:
+        wall_id = wall.Id
+
+        if wall_id.IntegerValue in tagged_wall_ids:
+            print(u"  [跳過] 牆 ID={}".format(wall_id.IntegerValue))
+            skipped_count += 1
+            continue
+
+        loc = wall.Location
+        if not isinstance(loc, LocationCurve):
+            failed_count += 1
+            failed_info.append(u"ID={} 非曲線定位牆".format(wall_id.IntegerValue))
+            continue
+
+        curve = loc.Curve
+        if curve is None:
+            failed_count += 1
+            failed_info.append(u"ID={} 定位線為 None".format(wall_id.IntegerValue))
+            continue
+
+        # 牆走向、法線、中點
+        start_pt = curve.GetEndPoint(0)
+        end_pt   = curve.GetEndPoint(1)
+        wall_dir = (end_pt - start_pt).Normalize()
+        normal   = XYZ(-wall_dir.Y, wall_dir.X, 0).Normalize()
+        mid_pt   = curve.Evaluate(0.5, True)
+        half_w   = wall.Width / 2.0
+
+        # 標註線
+        dim_start = XYZ(
+            mid_pt.X + normal.X * (half_w + DIM_OFFSET_FT),
+            mid_pt.Y + normal.Y * (half_w + DIM_OFFSET_FT),
+            mid_pt.Z
+        )
+        dim_end = XYZ(
+            mid_pt.X - normal.X * (half_w + DIM_OFFSET_FT),
+            mid_pt.Y - normal.Y * (half_w + DIM_OFFSET_FT),
+            mid_pt.Z
+        )
+        dim_line = Line.CreateBound(dim_start, dim_end)
+
+        # 牆面參考
+        ref_ext, ref_int = get_wall_references(wall)
+        if ref_ext is None or ref_int is None:
+            failed_count += 1
+            failed_info.append(u"ID={} 無法取得牆面參考".format(wall_id.IntegerValue))
+            continue
+
+        ref_array = ReferenceArray()
+        ref_array.Append(ref_ext)
+        ref_array.Append(ref_int)
+
+        try:
+            new_dim = doc.Create.NewDimension(target_view, dim_line, ref_array, dim_type)
+            if new_dim is not None:
+                print(u"  [成功] 牆ID={} | 牆厚={}mm | DimID={}".format(
+                    wall_id.IntegerValue,
+                    round(wall.Width * 304.8, 0),
+                    new_dim.Id.IntegerValue
+                ))
+                success_count += 1
+            else:
+                failed_count += 1
+                failed_info.append(u"ID={} NewDimension 回傳 None".format(wall_id.IntegerValue))
+        except Exception as e:
+            failed_count += 1
+            failed_info.append(u"ID={} → {}".format(wall_id.IntegerValue, str(e)))
+            print(u"  [失敗] 牆ID={} | {}".format(wall_id.IntegerValue, str(e)))
+
+    t.Commit()
+    print(u"\n✅ 交易已提交（Commit）")
+
+except Exception as e:
+    t.RollBack()
+    print(u"\n❌ 交易已回滾（RollBack）：{}".format(str(e)))
+    raise
+
+# ─────────────────────────────────────────
+# 8. 結果摘要
+# ─────────────────────────────────────────
+print(u"\n" + u"=" * 55)
+print(u"執行結果摘要")
+print(u"=" * 55)
+print(u"  ✅ 成功標註：{} 面".format(success_count))
+print(u"  ⏭  已有標註跳過：{} 面".format(skipped_count))
+print(u"  ❌ 標註失敗：{} 面".format(failed_count))
+if failed_info:
+    print(u"\n  失敗詳情：")
+    for info in failed_info:
+        print(u"    • " + info)
+print(u"=" * 55)
+
+TaskDialog.Show(
+    u"結構牆寬度自動標註 v1.0",
+    (
+        u"執行完成！（參考 A-1F-01 標準）\n\n"
+        u"目標視圖：{}\n"
+        u"標註類型：DIM(TXT_2mm)黑\n\n"
+        u"✅ 成功標註：{} 面\n"
+        u"⏭  已有標註跳過：{} 面\n"
+        u"❌ 標註失敗：{} 面"
+    ).format(target_view.Name, success_count, skipped_count, failed_count)
+)
