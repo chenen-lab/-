@@ -1,0 +1,312 @@
+# -*- coding: utf-8 -*-
+"""
+結構梁自動標註 v1.0
+適用環境：pyRevit 或 RevitPythonShell
+
+標籤族群規則：
+  梁 → -RC梁標籤(±0)  ID=448915（主要）
+  梁 → -RC梁標籤(+-) ID=448917（變斷面梁，型號含「-」符號）
+"""
+
+import math
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    BuiltInCategory,
+    IndependentTag,
+    TagMode,
+    TagOrientation,
+    LeaderEndCondition,
+    Reference,
+    XYZ,
+    ElementId,
+    FamilySymbol,
+    Transaction,
+    ViewType,
+)
+from Autodesk.Revit.UI import TaskDialog
+
+# ─────────────────────────────────────────
+# 1. 初始化與視圖驗證
+# ─────────────────────────────────────────
+doc         = __revit__.ActiveUIDocument.Document
+target_view = doc.ActiveView
+
+if target_view.ViewType not in (ViewType.CeilingPlan, ViewType.FloorPlan, ViewType.EngineeringPlan):
+    TaskDialog.Show(u"錯誤", u"請切換至平面或仰視圖後再執行。")
+    raise SystemExit
+
+# ─────────────────────────────────────────
+# 2. 標籤族群設定
+# ─────────────────────────────────────────
+BEAM_MAIN_TAG_ID = 448915   # -RC梁標籤(±0) → 一般梁
+BEAM_ALT_TAG_ID  = 448917   # -RC梁標籤(+-) → 變斷面梁（型號含「-」）
+
+beam_main_sym = doc.GetElement(ElementId(BEAM_MAIN_TAG_ID))
+beam_alt_sym  = doc.GetElement(ElementId(BEAM_ALT_TAG_ID))
+
+missing = []
+if beam_main_sym is None: missing.append(u"-RC梁標籤(±0) ID={}".format(BEAM_MAIN_TAG_ID))
+if beam_alt_sym  is None: missing.append(u"-RC梁標籤(+-) ID={}".format(BEAM_ALT_TAG_ID))
+if missing:
+    TaskDialog.Show(u"錯誤", u"找不到以下標籤族群：\n" + u"\n".join(missing))
+    raise SystemExit
+
+# ─────────────────────────────────────────
+# 3. 常數設定
+# ─────────────────────────────────────────
+def mm_to_ft(mm): return mm / 304.8
+
+BASE_OFFSET_FT = mm_to_ft(300.0)   # 梁中心外推 300mm
+MIN_SPACING_FT = mm_to_ft(250.0)   # 標籤間最小間距
+
+# 8 方向試錯（垂直梁軸優先）
+CANDIDATE_OFFSETS = [
+    ( 0,  1),   # 上（垂直梁軸，預設）
+    ( 0, -1),   # 下
+    ( 1,  0),   # 右
+    (-1,  0),   # 左
+    ( 1,  1),   # 右上
+    (-1,  1),   # 左上
+    ( 1, -1),   # 右下
+    (-1, -1),   # 左下
+]
+
+# ─────────────────────────────────────────
+# 4. 工具函式
+# ─────────────────────────────────────────
+def get_type_name_safe(element):
+    """安全讀取型號名稱，強制 UTF-8 處理"""
+    try:
+        type_el = doc.GetElement(element.GetTypeId())
+        if type_el is None: return u""
+        raw = type_el.Name or u""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw
+    except Exception:
+        return u""
+
+def is_variable_section_beam(type_name):
+    """
+    判斷是否為變斷面梁（型號含「-」，如 65x60-80cm）。
+    變斷面梁使用 -RC梁標籤(+-) 族群。
+    """
+    return u"-" in type_name and u"cm" in type_name.lower()
+
+def get_beam_center_and_normal(beam, view):
+    """
+    取得梁的幾何中心點與垂直梁軸的法線方向。
+    優先使用定位線計算，失敗則改用 BoundingBox。
+    回傳 (center, normal, safe_offset) 或 (None, None, None)
+    """
+    try:
+        from Autodesk.Revit.DB import LocationCurve, Line
+        loc = beam.Location
+        if isinstance(loc, LocationCurve):
+            curve = loc.Curve
+            if curve is not None:
+                # 梁中點
+                center = curve.Evaluate(0.5, True)
+                # 梁走向向量
+                start_pt  = curve.GetEndPoint(0)
+                end_pt    = curve.GetEndPoint(1)
+                beam_dir  = (end_pt - start_pt).Normalize()
+                # 垂直梁軸法線（XY 平面旋轉 90°）
+                normal = XYZ(-beam_dir.Y, beam_dir.X, 0).Normalize()
+                safe_offset = BASE_OFFSET_FT
+                return center, normal, safe_offset
+    except Exception:
+        pass
+
+    # fallback：BoundingBox 中心
+    try:
+        bbox = beam.get_BoundingBox(view)
+        if bbox is None: bbox = beam.get_BoundingBox(None)
+        if bbox is not None:
+            center = XYZ(
+                (bbox.Min.X + bbox.Max.X) / 2.0,
+                (bbox.Min.Y + bbox.Max.Y) / 2.0,
+                (bbox.Min.Z + bbox.Max.Z) / 2.0
+            )
+            normal = XYZ(0, 1, 0)  # 預設往上
+            safe_offset = BASE_OFFSET_FT
+            return center, normal, safe_offset
+    except Exception:
+        pass
+
+    return None, None, None
+
+def find_tag_position(center, normal, safe_offset, placed_positions):
+    """
+    以法線方向為基礎，8 方向試錯找出不衝突的標籤位置。
+    """
+    for (dx_mult, dy_mult) in CANDIDATE_OFFSETS:
+        # 結合法線方向與候選倍率
+        offset_x = (normal.X * dy_mult + (1 - abs(normal.X)) * dx_mult) * safe_offset
+        offset_y = (normal.Y * dy_mult + (1 - abs(normal.Y)) * dx_mult) * safe_offset
+
+        candidate = XYZ(center.X + offset_x, center.Y + offset_y, center.Z)
+        conflict = False
+        for p in placed_positions:
+            ddx = candidate.X - p.X
+            ddy = candidate.Y - p.Y
+            if math.sqrt(ddx*ddx + ddy*ddy) < MIN_SPACING_FT:
+                conflict = True
+                break
+        if not conflict:
+            return candidate
+
+    # 全衝突時回傳法線正方向最後位置
+    return XYZ(
+        center.X + normal.X * safe_offset * 2,
+        center.Y + normal.Y * safe_offset * 2,
+        center.Z
+    )
+
+# ─────────────────────────────────────────
+# 5. 掃描視圖中所有梁
+# ─────────────────────────────────────────
+view_id = target_view.Id
+
+beams = FilteredElementCollector(doc, view_id) \
+    .OfCategory(BuiltInCategory.OST_StructuralFraming) \
+    .WhereElementIsNotElementType() \
+    .ToElements()
+
+print(u"=" * 55)
+print(u"目標視圖：{}".format(target_view.Name))
+print(u"梁總數：{} 支".format(len(beams)))
+
+# 分類統計
+normal_beams   = [b for b in beams if not is_variable_section_beam(get_type_name_safe(b))]
+variable_beams = [b for b in beams if is_variable_section_beam(get_type_name_safe(b))]
+print(u"  一般梁：{} 支 → -RC梁標籤(±0)".format(len(normal_beams)))
+print(u"  變斷面梁：{} 支 → -RC梁標籤(+-)".format(len(variable_beams)))
+print(u"=" * 55)
+
+# ─────────────────────────────────────────
+# 6. 查詢已存在標籤（防重複 + 防重疊）
+# ─────────────────────────────────────────
+existing_tags = FilteredElementCollector(doc, view_id) \
+    .OfClass(IndependentTag) \
+    .WhereElementIsNotElementType() \
+    .ToElements()
+
+tagged_ids       = set()
+placed_positions = []
+
+for tg in existing_tags:
+    try:
+        for tid in tg.GetTaggedLocalElementIds():
+            tagged_ids.add(tid.IntegerValue)
+    except Exception:
+        pass
+    try:
+        placed_positions.append(tg.TagHeadPosition)
+    except Exception:
+        pass
+
+print(u"已有標籤的梁：{} 支".format(
+    len([b for b in beams if b.Id.IntegerValue in tagged_ids])
+))
+
+# ─────────────────────────────────────────
+# 7. 執行標註
+# ─────────────────────────────────────────
+success_count = 0
+skipped_count = 0
+failed_count  = 0
+failed_info   = []
+
+t = Transaction(doc, u"結構梁自動標註 v1.0（參考 A-1F-02）")
+t.Start()
+
+try:
+    for beam in beams:
+        beam_id   = beam.Id
+        type_name = get_type_name_safe(beam)
+        is_var    = is_variable_section_beam(type_name)
+
+        # 已有標籤則跳過
+        if beam_id.IntegerValue in tagged_ids:
+            skipped_count += 1
+            continue
+
+        # 取得幾何中心、法線、偏移量
+        center, normal, safe_offset = get_beam_center_and_normal(beam, target_view)
+        if center is None:
+            print(u"  [失敗] 梁 ID={} | {} | 無法取得幾何資訊".format(beam_id.IntegerValue, type_name))
+            failed_count += 1
+            failed_info.append(u"ID={} ({})".format(beam_id.IntegerValue, type_name))
+            continue
+
+        # 防重疊位置計算
+        tag_pos = find_tag_position(center, normal, safe_offset, placed_positions)
+
+        # 依梁類型選擇標籤族群
+        sym   = beam_alt_sym if is_var else beam_main_sym
+        label = u"-RC梁標籤(+-)" if is_var else u"-RC梁標籤(±0)"
+
+        # 建立標籤
+        try:
+            new_tag = IndependentTag.Create(
+                doc, view_id, Reference(beam),
+                True,                        # addLeader = True
+                TagMode.TM_ADDBY_CATEGORY,
+                TagOrientation.Horizontal,
+                tag_pos
+            )
+            new_tag.ChangeTypeId(sym.Id)
+            new_tag.LeaderEndCondition = LeaderEndCondition.Free
+            new_tag.TagHeadPosition = tag_pos
+
+            placed_positions.append(tag_pos)
+            print(u"  [成功] ID={} | {} | {} | TagID={}".format(
+                beam_id.IntegerValue, type_name, label, new_tag.Id.IntegerValue))
+            success_count += 1
+
+        except Exception as e:
+            print(u"  [錯誤] ID={} | {} | {}".format(beam_id.IntegerValue, type_name, str(e)))
+            failed_count += 1
+            failed_info.append(u"ID={} ({}) → {}".format(beam_id.IntegerValue, type_name, str(e)))
+
+    t.Commit()
+    print(u"\n✅ 交易已提交（Commit）")
+
+except Exception as e:
+    t.RollBack()
+    print(u"\n❌ 交易已回滾（RollBack）：{}".format(str(e)))
+    raise
+
+# ─────────────────────────────────────────
+# 8. 結果摘要
+# ─────────────────────────────────────────
+print(u"\n" + u"=" * 55)
+print(u"執行結果摘要")
+print(u"=" * 55)
+print(u"  ✅ 成功標註：{} 支".format(success_count))
+print(u"  ⏭  已有標籤跳過：{} 支".format(skipped_count))
+print(u"  ❌ 標註失敗：{} 支".format(failed_count))
+if failed_info:
+    print(u"\n  失敗詳情：")
+    for info in failed_info:
+        print(u"    • " + info)
+print(u"=" * 55)
+
+TaskDialog.Show(
+    u"結構梁自動標註 v1.0",
+    (
+        u"執行完成！（參考 A-1F-02 標準）\n\n"
+        u"目標視圖：{}\n\n"
+        u"✅ 成功標註：{} 支\n"
+        u"⏭  已有標籤跳過：{} 支\n"
+        u"❌ 標註失敗：{} 支\n\n"
+        u"標籤族群：\n"
+        u"  一般梁（{} 支）→ -RC梁標籤(±0)\n"
+        u"  變斷面梁（{} 支）→ -RC梁標籤(+-)"
+    ).format(
+        target_view.Name,
+        success_count, skipped_count, failed_count,
+        len(normal_beams), len(variable_beams)
+    )
+)
