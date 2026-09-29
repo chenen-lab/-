@@ -1,293 +1,361 @@
 # -*- coding: utf-8 -*-
+"""結構柱自動標註：Revit 2022+ / IronPython 2.7。
+在 pyRevit 或 RevitPythonShell 執行，不是一般 Python 程式。
+處理目前平面視圖、本文件的結構柱；不含連結模型及建築柱。
 """
-結構柱自動標註 v4.2 — 智慧分型標籤版
-適用環境：pyRevit 或 RevitPythonShell
-
-修正重點（v4.2）：
-  - 矩形柱 → -柱標籤_cm      (ID=448308)  正確顯示寬x高
-  - 圓  柱 → -圓柱標籤(Ø)_cm (ID=448304)  正確顯示直徑
-  - 動態安全偏移：(柱體最大邊/2) + 300mm
-  - 8 方向防重疊演算法
-  - 強制開啟自由引線
-"""
-
+import os
+import re
 import math
+import clr
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.UI import TaskDialog
 
-doc         = __revit__.ActiveUIDocument.Document
-target_view = doc.ActiveView  # 自動抓取當前視圖
+FAMILY_PATH = u"C:/Users/chene/Desktop/-柱標籤(TXT_2.5mm).rfa"
+FAMILY_NAME = u"-柱標籤(TXT_2.5mm)"
+RECT_TYPE_NAME = u"-柱標籤_cm"
+CIRCLE_TYPE_NAME = u"-圓柱標籤(Ø)_cm"
+BASE_OFFSET = 300.0 / 304.8
+HEAD_SPACING_PAPER_MM = 8.0
+# 必要時填入：(u"柱族群名稱", u"柱類型名稱"): "circle" 或 "rect"
+SHAPE_OVERRIDES = {}
+DIRECTIONS = [(1, 1), (-1, 1), (1, -1), (-1, -1),
+              (1, 0), (-1, 0), (0, 1), (0, -1)]
 
-# ─────────────────────────────────────────
-# 1. 標籤族群設定
-# ─────────────────────────────────────────
-RECT_TAG_ID   = 448308   # -柱標籤_cm      → 矩形柱專用
-CIRCLE_TAG_ID = 448304   # -圓柱標籤(Ø)_cm → 圓柱專用
 
-rect_tag_sym   = doc.GetElement(ElementId(RECT_TAG_ID))
-circle_tag_sym = doc.GetElement(ElementId(CIRCLE_TAG_ID))
+class OverwriteOptions(IFamilyLoadOptions):
+    def OnFamilyFound(self, familyInUse, overwriteParameterValues):
+        overwriteParameterValues.Value = True
+        return True
 
-missing = []
-if rect_tag_sym   is None: missing.append(u"-柱標籤_cm (ID={})".format(RECT_TAG_ID))
-if circle_tag_sym is None: missing.append(u"-圓柱標籤(Ø)_cm (ID={})".format(CIRCLE_TAG_ID))
-if missing:
-    TaskDialog.Show(u"錯誤", u"找不到以下標籤族群：\n" + u"\n".join(missing))
-    raise SystemExit
+    def OnSharedFamilyFound(self, sharedFamily, familyInUse,
+                            source, overwriteParameterValues):
+        source.Value = FamilySource.Family
+        overwriteParameterValues.Value = True
+        return True
 
-# ─────────────────────────────────────────
-# 2. 常數設定
-# ─────────────────────────────────────────
-def mm_to_ft(mm): return mm / 304.8
 
-BASE_OFFSET_FT = mm_to_ft(300.0)   # 柱體邊緣外推 300mm
-MIN_SPACING_FT = mm_to_ft(250.0)   # 標籤間最小間距
-
-CANDIDATE_OFFSETS = [
-    ( 1,  1),   # 右上（預設）
-    (-1,  1),   # 左上
-    ( 1, -1),   # 右下
-    (-1, -1),   # 左下
-    ( 2,  1),   # 更右上
-    ( 1,  2),   # 右更上
-    (-2,  1),   # 更左上
-    ( 1, -2),   # 右更下
-]
-
-# ─────────────────────────────────────────
-# 3. 工具函式
-# ─────────────────────────────────────────
-def get_type_name_safe(element):
-    """安全讀取型號名稱，強制 UTF-8 處理"""
+def id_number(eid):
     try:
-        type_el = doc.GetElement(element.GetTypeId())
-        if type_el is None: return u""
-        raw = type_el.Name or u""
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        return raw
-    except Exception:
+        return eid.Value
+    except AttributeError:
+        return eid.IntegerValue
+
+
+def safe_name(element):
+    if element is None:
         return u""
-
-def is_circular_column(element):
-    """
-    三軌判定是否為圓柱：
-      方法 1：直徑參數（STRUCTURAL_SECTION_COMMON_DIAMETER）有值
-      方法 2：型號名稱含 Ø/ø/φ/Φ/∅/dia 等 Unicode 直徑符號
-      方法 3：BoundingBox 長寬比 < 1.05 且名稱不含「x」
-    """
-    # 方法 1：直徑參數
     try:
-        param_dia = element.get_Parameter(BuiltInParameter.STRUCTURAL_SECTION_COMMON_DIAMETER)
-        param_b   = element.get_Parameter(BuiltInParameter.STRUCTURAL_SECTION_COMMON_WIDTH)
-        if param_dia is not None and param_dia.HasValue:
-            return True
-        if param_b is not None and param_b.HasValue:
-            return False  # 有寬度參數 → 矩形柱
+        return Element.Name.GetValue(element)
     except Exception:
-        pass
+        p = element.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+        return (p.AsString() or u"") if p and p.HasValue else u""
 
-    # 方法 2：Unicode 關鍵字
-    type_name  = get_type_name_safe(element)
-    lower_name = type_name.lower()
-    for kw in [u"\u00d8", u"\u00f8", u"\u03c6", u"\u03a6", u"\u2205", u"dia", u"diam", u"d="]:
-        if kw.lower() in lower_name:
-            return True
 
-    # 方法 3：BoundingBox 長寬比 + 排除含「x」的正方形柱名稱
-    try:
-        bbox = element.get_BoundingBox(None)
-        if bbox is not None:
-            dx = abs(bbox.Max.X - bbox.Min.X)
-            dy = abs(bbox.Max.Y - bbox.Min.Y)
-            if dx > 0 and dy > 0:
-                ratio = max(dx, dy) / min(dx, dy)
-                if ratio < 1.05 and u"x" not in lower_name:
-                    return True
-    except Exception:
-        pass
+def column_names(doc, column):
+    symbol = doc.GetElement(column.GetTypeId())
+    family = symbol.Family.Name if isinstance(symbol, FamilySymbol) else u""
+    return family, safe_name(symbol)
 
+
+def normalized_name(name):
+    result = re.sub(u"\\s+", u"", name).lower()
+    for symbol in (u"ø", u"φ", u"∅"):
+        result = result.replace(symbol, u"ø")
+    return result
+
+
+def select_tag_type(symbols, requested):
+    exact = [s for s in symbols if safe_name(s) == requested]
+    if len(exact) == 1:
+        return exact[0]
+    matches = [s for s in symbols
+               if normalized_name(safe_name(s)) == normalized_name(requested)]
+    if len(matches) == 1:
+        return matches[0]
+    raise Exception(u"無法唯一找到標籤類型：{}\n可用類型：\n{}".format(
+        requested, u"\n".join(safe_name(s) for s in symbols)))
+
+
+def has_diameter(doc, column):
+    bip = getattr(BuiltInParameter, "STRUCTURAL_SECTION_COMMON_DIAMETER", None)
+    if bip is None:
+        return False
+    for owner in (column, doc.GetElement(column.GetTypeId())):
+        if owner is not None:
+            p = owner.get_Parameter(bip)
+            if (p is not None and p.HasValue
+                    and p.StorageType == StorageType.Double and p.AsDouble() > 0):
+                return True
     return False
 
-def find_tag_position(center, safe_offset, placed_positions):
-    """8 方向試錯，找出不與已放置標籤衝突的位置"""
-    for (dx_mult, dy_mult) in CANDIDATE_OFFSETS:
-        candidate = XYZ(
-            center.X + safe_offset * dx_mult,
-            center.Y + safe_offset * dy_mult,
-            center.Z
-        )
-        conflict = False
-        for p in placed_positions:
-            ddx = candidate.X - p.X
-            ddy = candidate.Y - p.Y
-            if math.sqrt(ddx*ddx + ddy*ddy) < MIN_SPACING_FT:
-                conflict = True
-                break
-        if not conflict:
-            return candidate
 
-    # 全衝突時回傳最後一個方向
-    dx_mult, dy_mult = CANDIDATE_OFFSETS[-1]
-    return XYZ(
-        center.X + safe_offset * dx_mult,
-        center.Y + safe_offset * dy_mult,
-        center.Z
-    )
+def collect_solids(geometry):
+    solids = []
+    if geometry is not None:
+        for item in geometry:
+            if isinstance(item, Solid):
+                if item.Faces.Size > 0 and item.Volume > 1e-9:
+                    solids.append(item)
+            elif isinstance(item, GeometryInstance):
+                solids.extend(collect_solids(item.GetInstanceGeometry()))
+    return solids
 
-# ─────────────────────────────────────────
-# 4. 掃描視圖中所有結構柱
-# ─────────────────────────────────────────
-view_id = target_view.Id
 
-columns = FilteredElementCollector(doc, view_id) \
-    .OfCategory(BuiltInCategory.OST_StructuralColumns) \
-    .WhereElementIsNotElementType() \
-    .ToElements()
+def regular_circular_solid(solid):
+    """完整實心等徑圓柱：同軸側面、兩端面及圓柱體積交叉確認。"""
+    cylinders, planes = [], []
+    for face in solid.Faces:
+        if isinstance(face, CylindricalFace):
+            cylinders.append(face)
+        elif isinstance(face, PlanarFace):
+            planes.append(face)
+        else:
+            return False
+    if not cylinders or len(planes) < 2:
+        return False
+    first = cylinders[0]
+    axis = first.Axis.Normalize()
+    origin = first.Origin
+    radius = first.get_Radius(0).GetLength()
+    tolerance = 0.1 / 304.8
+    if radius <= 0:
+        return False
+    for face in cylinders:
+        if abs(face.Axis.Normalize().DotProduct(axis)) < 1.0 - 1e-6:
+            return False
+        if face.Origin.Subtract(origin).CrossProduct(axis).GetLength() > tolerance:
+            return False
+        if abs(face.get_Radius(0).GetLength() - radius) > tolerance:
+            return False
+    caps = []
+    for face in planes:
+        if abs(face.FaceNormal.Normalize().DotProduct(axis)) < 1.0 - 1e-6:
+            return False
+        value = face.Origin.Subtract(origin).DotProduct(axis)
+        if not any(abs(value - old) <= tolerance for old in caps):
+            caps.append(value)
+    if len(caps) != 2:
+        return False
+    height = abs(caps[1] - caps[0])
+    if height <= tolerance:
+        return False
+    expected_volume = math.pi * radius * radius * height
+    return abs(solid.Volume - expected_volume) / expected_volume < 0.005
 
-print(u"=" * 55)
-print(u"目標視圖：{}".format(target_view.Name))
-print(u"結構柱總數：{} 支".format(len(columns)))
 
-circle_cols = [c for c in columns if is_circular_column(c)]
-rect_cols   = [c for c in columns if not is_circular_column(c)]
-print(u"  矩形柱：{} 支 → -柱標籤_cm".format(len(rect_cols)))
-print(u"  圓  柱：{} 支 → -圓柱標籤(Ø)_cm".format(len(circle_cols)))
-for col in circle_cols:
-    print(u"    → ID={} | 型號={}".format(col.Id.IntegerValue, get_type_name_safe(col)))
-print(u"=" * 55)
-
-# ─────────────────────────────────────────
-# 5. 查詢已存在標籤（防重複 + 防重疊）
-# ─────────────────────────────────────────
-existing_tags = FilteredElementCollector(doc, view_id) \
-    .OfClass(IndependentTag) \
-    .WhereElementIsNotElementType() \
-    .ToElements()
-
-tagged_ids       = set()
-placed_positions = []
-
-for tg in existing_tags:
+def circle_by_geometry(column):
+    options = Options()
+    options.ComputeReferences = False
+    options.IncludeNonVisibleObjects = False
+    options.DetailLevel = ViewDetailLevel.Fine
     try:
-        for tid in tg.GetTaggedLocalElementIds():
-            tagged_ids.add(tid.IntegerValue)
-    except Exception:
-        pass
+        solids = collect_solids(column.get_Geometry(options))
+        # 柱帽、底板、多實體及切割造型不靠此規則猜測。
+        return len(solids) == 1 and regular_circular_solid(solids[0])
+    except Exception as error:
+        print(u"[幾何辨識未完成] ID={} | {}".format(id_number(column.Id), error))
+        return False
+    finally:
+        options.Dispose()
+
+
+def classify_column(doc, column):
+    family, typename = column_names(doc, column)
+    key = (family, typename)
+    if key in SHAPE_OVERRIDES:
+        shape = SHAPE_OVERRIDES[key]
+        if shape not in ("rect", "circle"):
+            raise Exception(u"SHAPE_OVERRIDES 必須填 rect 或 circle。")
+        return shape
+    text = (family + u" " + typename).lower()
+    special = (u"橢圓", u"oval", u"ellipse", u"ellipt", u"h型", u"h形",
+               u"i型", u"i形", u"工字", u"十字", u"cross", u"wide flange")
+    if any(word in text for word in special):
+        return None
+    if has_diameter(doc, column):
+        return "circle"
+    if circle_by_geometry(column):
+        print(u"[幾何確認圓柱] ID={} | {} | {}".format(
+            id_number(column.Id), family, typename))
+        return "circle"
+    circle = (any(word in text for word in
+                  (u"圓柱", u"圆柱", u"圓形", u"圆形", u"circular", u"round"))
+              or re.search(u"[ØøφΦ∅]\\s*\\d|\\b(?:dia(?:meter)?|d)\\s*[=:]?\\s*\\d",
+                           text) is not None)
+    rectangle = (any(word in text for word in
+                     (u"矩形", u"方柱", u"方形", u"rectangular", u"square"))
+                 or re.search(u"\\d+(?:\\.\\d+)?\\s*[x×ｘ]\\s*\\d+(?:\\.\\d+)?",
+                              typename.lower()) is not None)
+    if circle and rectangle:
+        return None
+    if circle:
+        return "circle"
+    if rectangle:
+        return "rect"
+    return None
+
+
+def column_bounds(column, view):
+    bbox = column.get_BoundingBox(view)
+    if bbox is None:
+        bbox = column.get_BoundingBox(None)
+    if bbox is None:
+        raise Exception(u"找不到柱的幾何邊界。")
+    corners = [bbox.Transform.OfPoint(XYZ(x, y, z))
+               for x in (bbox.Min.X, bbox.Max.X)
+               for y in (bbox.Min.Y, bbox.Max.Y)
+               for z in (bbox.Min.Z, bbox.Max.Z)]
+    center = bbox.Transform.OfPoint(bbox.Min.Add(bbox.Max).Multiply(0.5))
+    right = [p.DotProduct(view.RightDirection) for p in corners]
+    up = [p.DotProduct(view.UpDirection) for p in corners]
+    return center, max(max(right) - min(right), max(up) - min(up)) / 2.0 + BASE_OFFSET
+
+
+def find_position(view, center, offset, placed):
+    minimum = HEAD_SPACING_PAPER_MM * view.Scale / 304.8
+    for ring in range(6):
+        distance = offset + ring * minimum
+        for dx, dy in DIRECTIONS:
+            candidate = center.Add(view.RightDirection.Multiply(distance * dx)).Add(
+                view.UpDirection.Multiply(distance * dy))
+            clear = True
+            for position in placed:
+                delta = candidate.Subtract(position)
+                spacing = math.sqrt(delta.DotProduct(view.RightDirection) ** 2
+                                    + delta.DotProduct(view.UpDirection) ** 2)
+                if spacing < minimum:
+                    clear = False
+                    break
+            if clear:
+                return candidate
+    raise Exception(u"找不到符合標籤中心間距的位置。")
+
+
+def main():
+    uidoc = __revit__.ActiveUIDocument
+    if uidoc is None:
+        raise Exception(u"請先開啟 Revit 專案。")
+    doc, view = uidoc.Document, uidoc.Document.ActiveView
+    if doc.IsFamilyDocument or doc.IsReadOnly:
+        raise Exception(u"請在可編輯的專案文件中執行。")
+    if view.IsTemplate or not isinstance(view, ViewPlan):
+        raise Exception(u"請切換到要標註的平面視圖。")
+    columns = sorted(list(FilteredElementCollector(doc, view.Id)
+                          .OfCategory(BuiltInCategory.OST_StructuralColumns)
+                          .WhereElementIsNotElementType()),
+                     key=lambda c: id_number(c.Id))
+    print(u"視圖：{} | 結構柱：{} 支".format(view.Name, len(columns)))
+    if not columns:
+        TaskDialog.Show(u"結構柱自動標註", u"目前視圖收集到的本文件結構柱：0 支。")
+        return
+    if not os.path.isfile(FAMILY_PATH):
+        raise Exception(u"找不到標籤檔案：\n{}".format(FAMILY_PATH))
+    tagged_ids, placed = set(), []
+    for tag in (FilteredElementCollector(doc, view.Id).OfClass(IndependentTag)
+                .WhereElementIsNotElementType()):
+        for eid in tag.GetTaggedLocalElementIds():
+            tagged_ids.add(id_number(eid))
+        try:
+            placed.append(tag.TagHeadPosition)
+        except Exception:
+            pass
+    jobs, unknown, failures = [], [], []
+    skipped = 0
+    for column in columns:
+        if id_number(column.Id) in tagged_ids:
+            skipped += 1
+            continue
+        shape = classify_column(doc, column)
+        if shape is None:
+            family, typename = column_names(doc, column)
+            unknown.append(u"ID={} | 族群={} | 類型={}".format(
+                id_number(column.Id), family, typename))
+        else:
+            jobs.append((column, shape))
+    successes = {"rect": 0, "circle": 0}
+    transaction = Transaction(doc, u"載入柱標籤及自動標註（圓柱修正版）")
     try:
-        placed_positions.append(tg.TagHeadPosition)
+        if transaction.Start() != TransactionStatus.Started:
+            raise Exception(u"無法開始交易。")
+        family_ref = clr.Reference[Family]()
+        loaded = doc.LoadFamily(FAMILY_PATH, OverwriteOptions(), family_ref)
+        if loaded:
+            family = family_ref.Value
+            if family is None or family.Name != FAMILY_NAME:
+                raise Exception(u"RFA 內族群名稱不符；預期：{}，實際：{}".format(
+                    FAMILY_NAME, family.Name if family is not None else u"無"))
+            load_status = u"族群已載入，允許覆寫既有類型參數值。"
+        else:
+            load_status = u"未回報重新載入成功，沿用既有族群；可能內容未變更，不宣稱覆寫成功。"
+        symbols = [s for s in FilteredElementCollector(doc).OfClass(FamilySymbol)
+                   .OfCategory(BuiltInCategory.OST_StructuralColumnTags)
+                   if s.Family.Name == FAMILY_NAME]
+        if not symbols:
+            raise Exception(u"專案中找不到指定的結構柱標籤族群。")
+        selected = {}
+        needed = set(shape for column, shape in jobs)
+        if "rect" in needed:
+            selected["rect"] = select_tag_type(symbols, RECT_TYPE_NAME)
+        if "circle" in needed:
+            selected["circle"] = select_tag_type(symbols, CIRCLE_TYPE_NAME)
+        for symbol in selected.values():
+            if not symbol.IsActive:
+                symbol.Activate()
+        doc.Regenerate()
+        for column, shape in jobs:
+            sub = SubTransaction(doc)
+            try:
+                if sub.Start() != TransactionStatus.Started:
+                    raise Exception(u"無法開始個別柱交易。")
+                center, offset = column_bounds(column, view)
+                position = find_position(view, center, offset, placed)
+                reference = Reference(column)
+                tag = IndependentTag.Create(doc, selected[shape].Id, view.Id,
+                                            reference, True, TagOrientation.Horizontal, center)
+                tag.LeaderEndCondition = LeaderEndCondition.Free
+                tag.SetLeaderEnd(reference, center)
+                tag.TagHeadPosition = position
+                doc.Regenerate()
+                text = tag.TagText or u""
+                if not text.strip() or u"?" in text or u"？" in text:
+                    raise Exception(u"標籤文字為空或含問號，請檢查柱編號／尺寸參數。")
+                if sub.Commit() != TransactionStatus.Committed:
+                    raise Exception(u"個別柱交易未成功提交。")
+                placed.append(position)
+                successes[shape] += 1
+                print(u"[成功] ID={} | {} | {}".format(
+                    id_number(column.Id), safe_name(selected[shape]), text.replace(u"\n", u" / ")))
+            except Exception as error:
+                if sub.GetStatus() == TransactionStatus.Started:
+                    sub.RollBack()
+                failures.append(u"ID={} | {} | {}".format(
+                    id_number(column.Id), column_names(doc, column)[1], error))
+            finally:
+                sub.Dispose()
+        status = transaction.Commit()
+        if status != TransactionStatus.Committed:
+            raise Exception(u"整體交易未成功提交，本次標註不列為成功。狀態：{}".format(status))
     except Exception:
-        pass
+        if transaction.GetStatus() == TransactionStatus.Started:
+            transaction.RollBack()
+        raise
+    finally:
+        transaction.Dispose()
+    for item in unknown:
+        print(u"[需確認柱型] " + item)
+    for item in failures:
+        print(u"[標註失敗] " + item)
+    summary = (u"視圖：{}\n\n掃描結構柱：{} 支\n新增標註成功：{} 支\n"
+               u"  矩形柱 cm：{} 支\n  圓柱 cm：{} 支\n已有標籤跳過：{} 支\n"
+               u"柱型無法判定：{} 支\n標註失敗：{} 支\n\n{}\n\n詳細原因請查看執行輸出。"
+               ).format(view.Name, len(columns), sum(successes.values()),
+                        successes["rect"], successes["circle"], skipped,
+                        len(unknown), len(failures), load_status)
+    print(summary)
+    TaskDialog.Show(u"結構柱自動標註結果", summary)
 
-print(u"已有標籤元件：{} 個".format(len(tagged_ids)))
-
-# ─────────────────────────────────────────
-# 6. 執行標註
-# ─────────────────────────────────────────
-success_count = 0
-skipped_count = 0
-failed_count  = 0
-failed_info   = []
-
-t = Transaction(doc, u"結構柱自動標註 v4.2（智慧分型）")
-t.Start()
 
 try:
-    for col in columns:
-        col_id    = col.Id
-        type_name = get_type_name_safe(col)
-        is_circle = is_circular_column(col)
-
-        # 已有標籤則跳過
-        if col_id.IntegerValue in tagged_ids:
-            print(u"  [跳過] ID={} | {}".format(col_id.IntegerValue, type_name))
-            skipped_count += 1
-            continue
-
-        # 取得幾何邊界與中心點
-        bbox = col.get_BoundingBox(target_view)
-        if bbox is None: bbox = col.get_BoundingBox(None)
-        if bbox is None:
-            print(u"  [失敗] ID={} | {} | 無BBox".format(col_id.IntegerValue, type_name))
-            failed_count += 1
-            failed_info.append(u"ID={} ({})".format(col_id.IntegerValue, type_name))
-            continue
-
-        center = XYZ(
-            (bbox.Min.X + bbox.Max.X) / 2.0,
-            (bbox.Min.Y + bbox.Max.Y) / 2.0,
-            (bbox.Min.Z + bbox.Max.Z) / 2.0
-        )
-
-        # 動態安全偏移：(最大邊/2) + 300mm
-        max_half   = max(abs(bbox.Max.X - bbox.Min.X), abs(bbox.Max.Y - bbox.Min.Y)) / 2.0
-        safe_offset = max_half + BASE_OFFSET_FT
-
-        # 防重疊位置計算
-        tag_pos = find_tag_position(center, safe_offset, placed_positions)
-
-        # 依柱型選擇正確標籤族群
-        sym   = circle_tag_sym if is_circle else rect_tag_sym
-        label = u"-圓柱標籤(Ø)_cm" if is_circle else u"-柱標籤_cm"
-
-        # 建立標籤
-        try:
-            new_tag = IndependentTag.Create(
-                doc, view_id, Reference(col),
-                True,                        # addLeader = True
-                TagMode.TM_ADDBY_CATEGORY,
-                TagOrientation.Horizontal,
-                tag_pos
-            )
-            new_tag.ChangeTypeId(sym.Id)             # 強制指定族群（防隱形）
-            new_tag.LeaderEndCondition = LeaderEndCondition.Free
-            new_tag.TagHeadPosition = tag_pos
-
-            placed_positions.append(tag_pos)
-            print(u"  [成功] ID={} | {} | {} | TagID={}".format(
-                col_id.IntegerValue, type_name, label, new_tag.Id.IntegerValue))
-            success_count += 1
-
-        except Exception as e:
-            print(u"  [錯誤] ID={} | {} | {}".format(col_id.IntegerValue, type_name, str(e)))
-            failed_count += 1
-            failed_info.append(u"ID={} ({}) → {}".format(col_id.IntegerValue, type_name, str(e)))
-
-    t.Commit()
-    print(u"\n✅ 交易已提交（Commit）")
-
-except Exception as e:
-    t.RollBack()
-    print(u"\n❌ 交易已回滾（RollBack）：{}".format(str(e)))
-    raise
-
-# ─────────────────────────────────────────
-# 7. 結果摘要
-# ─────────────────────────────────────────
-print(u"\n" + u"=" * 55)
-print(u"執行結果摘要")
-print(u"=" * 55)
-print(u"  ✅ 成功標註：{} 支".format(success_count))
-print(u"  ⏭  跳過    ：{} 支".format(skipped_count))
-print(u"  ❌ 失敗    ：{} 支".format(failed_count))
-if failed_info:
-    for info in failed_info:
-        print(u"    • " + info)
-print(u"=" * 55)
-
-TaskDialog.Show(
-    u"結構柱自動標註 v4.2",
-    (
-        u"執行完成！\n\n"
-        u"目標視圖：{}\n\n"
-        u"✅ 成功標註：{} 支\n"
-        u"⏭  已有標籤跳過：{} 支\n"
-        u"❌ 標註失敗：{} 支\n\n"
-        u"標籤族群：\n"
-        u"  矩形柱（{} 支）→ -柱標籤_cm\n"
-        u"  圓  柱（{} 支）→ -圓柱標籤(Ø)_cm"
-    ).format(
-        target_view.Name,
-        success_count, skipped_count, failed_count,
-        len(rect_cols), len(circle_cols)
-    )
-)
+    main()
+except Exception as error:
+    TaskDialog.Show(u"結構柱自動標註未完成", u"{}\n\n未提交的修改會回滾。".format(error))
