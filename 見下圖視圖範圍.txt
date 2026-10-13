@@ -1,0 +1,107 @@
+見下圖視圖範圍
+# -*- coding: utf-8 -*-
+
+import clr
+clr.AddReference("RevitAPI")
+
+from Autodesk.Revit.DB import (
+    Transaction,
+    TransactionStatus,
+    ViewPlan,
+    ViewSheet,
+    PlanViewPlane,
+    ElementId
+)
+
+uidoc = __revit__.ActiveUIDocument
+doc = uidoc.Document
+
+def cm_to_ft(value):
+    return value / 30.48
+
+def update_range(view):
+
+    # 若有視圖樣板，解除關聯以允許修改
+    if view.ViewTemplateId != ElementId.InvalidElementId:
+        view.ViewTemplateId = ElementId.InvalidElementId
+        print("  View template detached")
+
+    vr = view.GetViewRange()
+
+    level = view.GenLevel
+    if level is None:
+        raise Exception("No associated level")
+
+    level_id = level.Id
+
+    top = PlanViewPlane.TopClipPlane
+    cut = PlanViewPlane.CutPlane
+    bottom = PlanViewPlane.BottomClipPlane
+    depth = PlanViewPlane.ViewDepthPlane
+
+    # 四個平面統一以關聯樓層為基準
+    for plane in [top, cut, bottom, depth]:
+        vr.SetLevelId(plane, level_id)
+
+    # 原剖切面高度，若超出範圍則調整
+    original_cut = vr.GetOffset(cut)
+    new_cut = max(
+        cm_to_ft(0),
+        min(original_cut, cm_to_ft(150))
+    )
+
+    # 設定視圖範圍 0 ~ +150 cm
+    vr.SetOffset(top, cm_to_ft(150))
+    vr.SetOffset(cut, new_cut)
+    vr.SetOffset(bottom, cm_to_ft(0))
+    vr.SetOffset(depth, cm_to_ft(0))
+
+    view.SetViewRange(vr)
+
+    print("  SUCCESS: 0 ~ +150 cm")
+
+
+def main():
+
+    active = uidoc.ActiveView
+    views = []
+
+    if isinstance(active, ViewSheet):
+        for vid in active.GetAllPlacedViews():
+            v = doc.GetElement(vid)
+            if isinstance(v, ViewPlan):
+                views.append(v)
+
+    elif isinstance(active, ViewPlan):
+        views.append(active)
+
+    if not views:
+        print("No plan views found")
+        return
+
+    success = 0
+    failed = 0
+
+    for view in views:
+
+        t = Transaction(doc, "Set View Range 0-150cm")
+
+        try:
+            t.Start()
+            update_range(view)
+            t.Commit()
+            success += 1
+
+        except Exception as e:
+            if t.GetStatus() == TransactionStatus.Started:
+                t.RollBack()
+            print("FAILED: {} | {}".format(view.Name, e))
+            failed += 1
+
+    print("-------------------------")
+    print("Completed")
+    print("Success: {}".format(success))
+    print("Failed: {}".format(failed))
+
+
+main()
