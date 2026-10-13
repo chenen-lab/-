@@ -1,0 +1,105 @@
+掃描目前的圖的所有結構
+# -*- coding: utf-8 -*-
+# Revit 結構數量自動掃描 V2.4
+# 僅掃描目前開啟的圖面
+
+import clr
+clr.AddReference("RevitAPI")
+
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    BuiltInCategory,
+    ViewPlan,
+    ViewSheet
+)
+
+uidoc = __revit__.ActiveUIDocument
+doc = uidoc.Document
+
+# 要掃描的結構種類
+categories = [
+    ("梁", BuiltInCategory.OST_StructuralFraming),
+    ("結構柱", BuiltInCategory.OST_StructuralColumns),
+    ("建築柱", BuiltInCategory.OST_Columns),
+    ("樓板", BuiltInCategory.OST_Floors),
+    ("牆", BuiltInCategory.OST_Walls),
+    ("樓梯", BuiltInCategory.OST_Stairs),
+    ("樓梯梯段", BuiltInCategory.OST_StairsRuns),
+    ("樓梯平台", BuiltInCategory.OST_StairsLandings),
+    ("結構基礎", BuiltInCategory.OST_StructuralFoundation)
+]
+
+
+def get_views():
+
+    active = uidoc.ActiveView
+
+    # 目前開啟的是平面視圖
+    if isinstance(active, ViewPlan):
+        return [active]
+
+    # 目前開啟的是圖紙
+    if isinstance(active, ViewSheet):
+
+        views = []
+
+        for viewport_id in active.GetAllViewports():
+
+            viewport = doc.GetElement(viewport_id)
+            view = doc.GetElement(viewport.ViewId)
+
+            if isinstance(view, ViewPlan):
+                views.append(view)
+
+        return views
+
+    return []
+
+
+def scan_view(view):
+
+    print("\n================================")
+    print("目前掃描圖面：{}".format(view.Name))
+    print("================================")
+
+    total = 0
+
+    for name, category in categories:
+
+        try:
+            count = (
+                FilteredElementCollector(doc, view.Id)
+                .OfCategory(category)
+                .WhereElementIsNotElementType()
+                .GetElementCount()
+            )
+
+            print("{}：{} 個".format(name, count))
+            total += count
+
+        except Exception as e:
+            print("{}：掃描失敗 ({})".format(name, e))
+
+    print("--------------------------------")
+    print("結構總數：{} 個".format(total))
+    print("================================")
+
+
+def main():
+
+    views = get_views()
+
+    if not views:
+        print("找不到可掃描的平面視圖")
+        print("請先開啟結構平面圖或包含平面視圖的圖紙")
+        return
+
+    print("【Revit 結構數量自動掃描】")
+
+    for view in views:
+        scan_view(view)
+
+    print("\n【掃描完成】")
+
+
+main()
