@@ -1,4 +1,4 @@
-見下圖視圖範圍
+
 # -*- coding: utf-8 -*-
 
 import clr
