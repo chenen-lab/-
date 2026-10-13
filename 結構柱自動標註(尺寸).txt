@@ -1,0 +1,847 @@
+結構柱自動標註(尺寸)
+# -*- coding: utf-8 -*-
+# Revit 結構柱自動標註 V3.6.1
+# 全部矩形柱 + 圓柱 + 避開其他柱體
+
+import clr
+import traceback
+
+clr.AddReference("RevitAPI")
+
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    BuiltInCategory,
+    ViewPlan,
+    ViewSheet,
+    FamilyInstance,
+    Options,
+    Solid,
+    GeometryInstance,
+    PlanarFace,
+    CylindricalFace,
+    Transform,
+    XYZ,
+    Line,
+    ReferenceArray,
+    Transaction,
+    TransactionStatus
+)
+
+uidoc = __revit__.ActiveUIDocument
+doc = uidoc.Document
+
+# ==========================================
+# 一、設定
+# ==========================================
+
+# 0 = 全部結構柱
+MAX_COLUMNS = 0
+
+# 優先嘗試的標註距離，單位 mm
+OFFSET_OPTIONS_MM = [
+    600.0,
+    800.0,
+    1000.0,
+    1200.0,
+    1500.0
+]
+
+HELPER_MM = 200.0
+EXTRA_MM = 300.0
+CLEARANCE_MM = 20.0
+NORMAL_TOL = 0.98
+
+
+def mmft(value):
+    return value / 304.8
+
+
+def horizontal(v):
+    p = XYZ(v.X, v.Y, 0)
+
+    if p.GetLength() < 0.000001:
+        raise Exception("無效的水平方向")
+
+    return p.Normalize()
+
+
+# ==========================================
+# 二、取得目前圖面
+# ==========================================
+
+def get_views():
+
+    active = uidoc.ActiveView
+
+    if isinstance(active, ViewPlan):
+        return [active]
+
+    if isinstance(active, ViewSheet):
+
+        result = []
+        seen = set()
+
+        for vp_id in active.GetAllViewports():
+
+            vp = doc.GetElement(vp_id)
+
+            if vp is None:
+                continue
+
+            view = doc.GetElement(vp.ViewId)
+
+            if isinstance(view, ViewPlan):
+
+                vid = view.Id.IntegerValue
+
+                if vid not in seen:
+                    result.append(view)
+                    seen.add(vid)
+
+        return result
+
+    return []
+
+
+# ==========================================
+# 三、建立柱體障礙範圍
+# ==========================================
+
+def view_xy(view, point):
+
+    delta = point.Subtract(view.Origin)
+
+    return (
+        delta.DotProduct(view.RightDirection),
+        delta.DotProduct(view.UpDirection)
+    )
+
+
+def get_obstacle(view, element):
+
+    bb = element.get_BoundingBox(None)
+
+    if bb is None:
+        return None
+
+    points = []
+
+    for x in [bb.Min.X, bb.Max.X]:
+        for y in [bb.Min.Y, bb.Max.Y]:
+            for z in [bb.Min.Z, bb.Max.Z]:
+
+                p = XYZ(x, y, z)
+                points.append(view_xy(view, p))
+
+    margin = mmft(CLEARANCE_MM)
+
+    return {
+        "id": element.Id.IntegerValue,
+        "xmin": min(p[0] for p in points) - margin,
+        "xmax": max(p[0] for p in points) + margin,
+        "ymin": min(p[1] for p in points) - margin,
+        "ymax": max(p[1] for p in points) + margin
+    }
+
+
+# ==========================================
+# 四、碰撞判斷
+# ==========================================
+
+def segment_hits_box(p1, p2, box):
+
+    x1, y1 = p1
+    x2, y2 = p2
+
+    dx = x2 - x1
+    dy = y2 - y1
+
+    tmin = 0.0
+    tmax = 1.0
+
+    tests = [
+        (-dx, x1 - box["xmin"]),
+        (dx, box["xmax"] - x1),
+        (-dy, y1 - box["ymin"]),
+        (dy, box["ymax"] - y1)
+    ]
+
+    for p, q in tests:
+
+        if abs(p) < 1e-10:
+
+            if q < 0:
+                return False
+
+        else:
+
+            r = q / p
+
+            if p < 0:
+                tmin = max(tmin, r)
+            else:
+                tmax = min(tmax, r)
+
+            if tmin > tmax:
+                return False
+
+    return True
+
+
+def collision(view, segments, obstacles, current_id):
+
+    for obstacle in obstacles:
+
+        if obstacle["id"] == current_id:
+            continue
+
+        for a, b in segments:
+
+            if segment_hits_box(
+                view_xy(view, a),
+                view_xy(view, b),
+                obstacle
+            ):
+                return obstacle["id"]
+
+    return None
+
+
+# ==========================================
+# 五、讀取柱幾何
+# ==========================================
+
+def get_geometry(column):
+
+    opt = Options()
+    opt.ComputeReferences = True
+    opt.IncludeNonVisibleObjects = False
+
+    geometry = column.get_Geometry(opt)
+
+    planar = []
+    cylinders = []
+
+    def inspect(items, tf):
+
+        for obj in items:
+
+            if isinstance(obj, Solid):
+
+                if obj.Volume <= 0:
+                    continue
+
+                for face in obj.Faces:
+
+                    if isinstance(face, PlanarFace):
+
+                        if face.Reference is None:
+                            continue
+
+                        normal = tf.OfVector(
+                            face.FaceNormal
+                        )
+
+                        if abs(normal.Z) > 0.05:
+                            continue
+
+                        planar.append({
+                            "ref": face.Reference,
+                            "normal": horizontal(normal),
+                            "origin": tf.OfPoint(face.Origin),
+                            "area": face.Area
+                        })
+
+                    elif isinstance(face, CylindricalFace):
+
+                        axis = tf.OfVector(
+                            face.Axis
+                        ).Normalize()
+
+                        if abs(axis.Z) < 0.98:
+                            continue
+
+                        radius = (
+                            face.get_Radius(0).GetLength()
+                        )
+
+                        if radius <= 0:
+                            continue
+
+                        cylinders.append({
+                            "radius": radius,
+                            "center": tf.OfPoint(face.Origin),
+                            "area": face.Area
+                        })
+
+            elif isinstance(obj, GeometryInstance):
+
+                next_tf = tf.Multiply(obj.Transform)
+
+                inspect(
+                    obj.GetSymbolGeometry(),
+                    next_tf
+                )
+
+    inspect(geometry, Transform.Identity)
+
+    return planar, cylinders
+
+
+# ==========================================
+# 六、尋找矩形柱相對面
+# ==========================================
+
+def find_faces(faces, direction):
+
+    positive = []
+    negative = []
+
+    for face in faces:
+
+        dot = face["normal"].DotProduct(direction)
+        pos = face["origin"].DotProduct(direction)
+
+        if dot >= NORMAL_TOL:
+            positive.append((pos, face))
+
+        elif dot <= -NORMAL_TOL:
+            negative.append((pos, face))
+
+    if not positive or not negative:
+        return None
+
+    positive.sort(
+        key=lambda x: (x[0], x[1]["area"]),
+        reverse=True
+    )
+
+    negative.sort(
+        key=lambda x: (x[0], -x[1]["area"])
+    )
+
+    p2, f2 = positive[0]
+    p1, f1 = negative[0]
+
+    width = p2 - p1
+
+    if width <= mmft(1):
+        return None
+
+    return (f1, f2, width, p1, p2)
+
+
+# ==========================================
+# 七、預測尺寸線與尺寸界線
+# ==========================================
+
+def make_candidate(
+    view,
+    center,
+    direction,
+    half_width,
+    side,
+    offset_mm,
+    projection_pair=None
+):
+
+    normal = horizontal(
+        XYZ.BasisZ.CrossProduct(direction)
+    ).Multiply(side)
+
+    distance = half_width + mmft(offset_mm)
+
+    base = center.Add(
+        normal.Multiply(distance)
+    )
+
+    half = half_width + mmft(EXTRA_MM)
+
+    start = base.Subtract(
+        direction.Multiply(half)
+    )
+
+    end = base.Add(
+        direction.Multiply(half)
+    )
+
+    if projection_pair is None:
+
+        witness1 = center.Subtract(
+            direction.Multiply(half_width)
+        )
+
+        witness2 = center.Add(
+            direction.Multiply(half_width)
+        )
+
+    else:
+
+        pos1, pos2 = projection_pair
+        current = center.DotProduct(direction)
+
+        witness1 = center.Add(
+            direction.Multiply(pos1 - current)
+        )
+
+        witness2 = center.Add(
+            direction.Multiply(pos2 - current)
+        )
+
+    end1 = witness1.Add(
+        normal.Multiply(distance)
+    )
+
+    end2 = witness2.Add(
+        normal.Multiply(distance)
+    )
+
+    return {
+        "line": Line.CreateBound(start, end),
+        "segments": [
+            (start, end),
+            (witness1, end1),
+            (witness2, end2)
+        ],
+        "side": side,
+        "offset": offset_mm
+    }
+
+
+# ==========================================
+# 八、智慧選擇標註位置
+# ==========================================
+
+def choose_candidate(
+    view,
+    column,
+    center,
+    direction,
+    half_width,
+    obstacles,
+    preferred_side,
+    projection_pair=None
+):
+
+    # 優先原方向，所有距離都試過才換反方向
+    for side in [
+        preferred_side,
+        -preferred_side
+    ]:
+
+        for offset in OFFSET_OPTIONS_MM:
+
+            candidate = make_candidate(
+                view,
+                center,
+                direction,
+                half_width,
+                side,
+                offset,
+                projection_pair
+            )
+
+            hit = collision(
+                view,
+                candidate["segments"],
+                obstacles,
+                column.Id.IntegerValue
+            )
+
+            if hit is None:
+                return candidate
+
+    return None
+
+
+# ==========================================
+# 九、圓柱輔助詳圖線
+# ==========================================
+
+def create_helper(
+    view,
+    center,
+    direction,
+    position
+):
+
+    perpendicular = horizontal(
+        XYZ.BasisZ.CrossProduct(direction)
+    )
+
+    point = center.Add(
+        direction.Multiply(position)
+    )
+
+    half = mmft(HELPER_MM) / 2.0
+
+    a = point.Subtract(
+        perpendicular.Multiply(half)
+    )
+
+    b = point.Add(
+        perpendicular.Multiply(half)
+    )
+
+    detail = doc.Create.NewDetailCurve(
+        view,
+        Line.CreateBound(a, b)
+    )
+
+    doc.Regenerate()
+
+    ref = detail.GeometryCurve.Reference
+
+    if ref is None:
+        raise Exception("無法取得圓柱輔助線參考")
+
+    return ref
+
+
+# ==========================================
+# 十、建立尺寸
+# ==========================================
+
+def create_dimension(view, refs, candidate):
+
+    references = ReferenceArray()
+
+    for ref in refs:
+        references.Append(ref)
+
+    dim = doc.Create.NewDimension(
+        view,
+        candidate["line"],
+        references
+    )
+
+    if dim is None:
+        raise Exception("尺寸建立失敗")
+
+    return dim
+
+
+# ==========================================
+# 十一、單支柱自動標註
+# ==========================================
+
+def annotate_column(view, column, obstacles):
+
+    if not isinstance(column, FamilyInstance):
+        raise Exception("不是可處理的柱族實例")
+
+    planar, cylinders = get_geometry(column)
+
+    location = column.Location
+
+    if location is None:
+        raise Exception("缺少柱定位資訊")
+
+    center = XYZ(
+        location.Point.X,
+        location.Point.Y,
+        view.Origin.Z
+    )
+
+    tasks = []
+
+    if cylinders:
+
+        cylinders.sort(
+            key=lambda x: (
+                x["radius"],
+                x["area"]
+            ),
+            reverse=True
+        )
+
+        circle = cylinders[0]
+
+        radius = circle["radius"]
+        cp = circle["center"]
+
+        center = XYZ(
+            cp.X,
+            cp.Y,
+            view.Origin.Z
+        )
+
+        shape = "圓柱"
+
+        tasks = [
+            (
+                "水平",
+                horizontal(view.RightDirection),
+                1.0,
+                radius,
+                None,
+                None
+            ),
+            (
+                "垂直",
+                horizontal(view.UpDirection),
+                -1.0,
+                radius,
+                None,
+                None
+            )
+        ]
+
+    else:
+
+        shape = "矩形柱"
+
+        directions = [
+            (
+                "第一方向",
+                horizontal(column.HandOrientation),
+                1.0
+            ),
+            (
+                "第二方向",
+                horizontal(column.FacingOrientation),
+                -1.0
+            )
+        ]
+
+        for name, direction, side in directions:
+
+            pair = find_faces(planar, direction)
+
+            if pair is None:
+                raise Exception(
+                    "{}缺少有效相對面".format(name)
+                )
+
+            f1, f2, width, p1, p2 = pair
+
+            tasks.append((
+                name,
+                direction,
+                side,
+                width / 2.0,
+                [f1["ref"], f2["ref"]],
+                (p1, p2)
+            ))
+
+    planned = []
+
+    # 先完成避讓規劃，再建立尺寸
+    for name, direction, preferred_side, half_width, refs, projections in tasks:
+
+        candidate = choose_candidate(
+            view,
+            column,
+            center,
+            direction,
+            half_width,
+            obstacles,
+            preferred_side,
+            projections
+        )
+
+        if candidate is None:
+            raise Exception(
+                "{}找不到不遮擋其他柱的位置".format(name)
+            )
+
+        planned.append((
+            name,
+            direction,
+            half_width,
+            refs,
+            candidate,
+            preferred_side
+        ))
+
+    created = []
+
+    for name, direction, half_width, refs, candidate, preferred_side in planned:
+
+        if shape == "圓柱":
+
+            r1 = create_helper(
+                view, center, direction, -half_width
+            )
+
+            r2 = create_helper(
+                view, center, direction, half_width
+            )
+
+            refs = [r1, r2]
+
+        dim = create_dimension(
+            view,
+            refs,
+            candidate
+        )
+
+        created.append(dim)
+
+        direction_name = (
+            "原方向"
+            if candidate["side"] == preferred_side
+            else "反方向"
+        )
+
+        print(
+            "  {}尺寸完成 | {} | 偏移 {:.0f} mm".format(
+                name,
+                direction_name,
+                candidate["offset"]
+            )
+        )
+
+    return shape, created
+
+
+# ==========================================
+# 十二、處理目前圖紙所有柱
+# ==========================================
+
+def process_view(view):
+
+    print("\n================================")
+    print("目前圖面：{}".format(view.Name))
+    print("================================")
+
+    if view.GenLevel is None:
+        print("找不到關聯樓層，略過")
+        return
+
+    columns = list(
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(
+            BuiltInCategory.OST_StructuralColumns
+        )
+        .WhereElementIsNotElementType()
+    )
+
+    columns.sort(
+        key=lambda c: c.Id.IntegerValue
+    )
+
+    print("掃描到結構柱：{} 支".format(len(columns)))
+
+    obstacles = []
+
+    for column in columns:
+
+        obstacle = get_obstacle(view, column)
+
+        if obstacle is not None:
+            obstacles.append(obstacle)
+
+    print(
+        "建立柱體避讓範圍：{} 個".format(
+            len(obstacles)
+        )
+    )
+
+    targets = columns
+
+    if MAX_COLUMNS > 0:
+        targets = columns[:MAX_COLUMNS]
+
+    success_rect = 0
+    success_circle = 0
+    failed = 0
+
+    for column in targets:
+
+        cid = column.Id.IntegerValue
+
+        transaction = Transaction(
+            doc,
+            "結構柱自動標註 V3.6.1"
+        )
+
+        try:
+
+            transaction.Start()
+
+            shape, dims = annotate_column(
+                view,
+                column,
+                obstacles
+            )
+
+            status = transaction.Commit()
+
+            if status != TransactionStatus.Committed:
+                raise Exception("交易提交失敗")
+
+            if shape == "圓柱":
+                success_circle += 1
+            else:
+                success_rect += 1
+
+            print(
+                "柱 {}：{}成功，建立 {} 條尺寸".format(
+                    cid,
+                    shape,
+                    len(dims)
+                )
+            )
+
+        except Exception as e:
+
+            if (
+                transaction.GetStatus()
+                == TransactionStatus.Started
+            ):
+                transaction.RollBack()
+
+            failed += 1
+
+            print(
+                "柱 {}：標註失敗，{}".format(
+                    cid,
+                    str(e)
+                )
+            )
+
+    total = success_rect + success_circle
+
+    print("\n================================")
+    print("【V3.6.1 最終執行結果】")
+    print("掃描柱數：{}".format(len(columns)))
+    print("實際處理柱數：{}".format(len(targets)))
+    print("矩形柱成功：{} 支".format(success_rect))
+    print("圓柱成功：{} 支".format(success_circle))
+    print("失敗或略過：{} 支".format(failed))
+    print("成功建立尺寸：{} 條".format(total * 2))
+    print("================================")
+
+
+# ==========================================
+# 十三、主程式
+# ==========================================
+
+def main():
+
+    views = get_views()
+
+    if not views:
+        print("找不到目前圖紙中的平面視圖")
+        return
+
+    print("================================")
+    print("Revit 結構柱自動標註 V3.6.1")
+    print("矩形柱 + 圓柱 + 全部柱自動避讓")
+    print("全部柱模式：已啟用")
+    print("================================")
+
+    for view in views:
+
+        try:
+            process_view(view)
+
+        except Exception as e:
+            print("圖面處理失敗：{}".format(e))
+            traceback.print_exc()
+
+    print("\n【V3.6.1 全部執行完成】")
+
+
+main()
